@@ -7,9 +7,18 @@ from datetime import date, datetime, timezone
 
 import pandas as pd
 from sqlalchemy import text
-from statsmodels.tsa.holtwinters import SimpleExpSmoothing
 
 LOGGER = logging.getLogger("insightguard.models.forecast")
+
+
+def _simple_exponential_smoothing(series: pd.Series, horizon: int) -> pd.Series:
+    """Forecast a level series using the standard single-parameter update."""
+    alpha = min(1.0, max(0.01, 2.0 / (len(series) + 1)))
+    level = float(series.iloc[0])
+    for value in series.iloc[1:]:
+        level = alpha * float(value) + (1.0 - alpha) * level
+    index = pd.date_range(series.index[-1] + pd.Timedelta(days=1), periods=horizon, freq="D")
+    return pd.Series(level, index=index)
 
 
 def forecast_revenue(
@@ -40,11 +49,7 @@ def forecast_revenue(
         )
         if series.empty:
             continue
-        if len(series) >= 2 and series.nunique() > 1:
-            fitted = SimpleExpSmoothing(series, initialization_method="estimated").fit(optimized=True)
-            predictions = fitted.forecast(max_horizon)
-        else:
-            predictions = pd.Series(float(series.iloc[-1]), index=pd.date_range(series.index[-1] + pd.Timedelta(days=1), periods=max_horizon, freq="D"))
+        predictions = _simple_exponential_smoothing(series, max_horizon)
         predictions = predictions.clip(lower=0.0)
         for horizon in horizons:
             for forecast_date, value in predictions.iloc[:horizon].items():

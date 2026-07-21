@@ -7,6 +7,5 @@ SQLAlchemy==2.0.36
 boto3==1.35.76
 moto[s3]==5.0.27
 requests==2.32.3
-statsmodels==0.14.4
 pytest==8.3.4
 ruff==0.8.6
