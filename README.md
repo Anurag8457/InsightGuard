@@ -68,9 +68,9 @@ The default source is a public CSV conversion of the UCI Online Retail dataset. 
 
 Returns are retained as negative-quantity transactions. Missing `CustomerID` is allowed because it occurs in the source data; unknown customers receive a stable `UNKNOWN` dimension member during transformation.
 
-## Local setup without Docker
+## Local setup
 
-Docker is optional. The core pipeline runs with a local PostgreSQL server and a persistent Moto S3-compatible server.
+The core pipeline runs with a local PostgreSQL server and a persistent Moto S3-compatible server.
 
 ### 1. Install Python dependencies
 
@@ -123,15 +123,6 @@ Apply the BI views with:
 
 ```bash
 psql "$DATABASE_URL" -f dashboard/views.sql
-```
-
-### Optional Docker Compose services
-
-The Compose file provides PostgreSQL and Airflow for users who want a containerized orchestration environment. Moto remains a separate local process:
-
-```bash
-docker compose up -d postgres airflow-init airflow-webserver airflow-scheduler
-moto_server -H 0.0.0.0 -p 5000
 ```
 
 ## Data flow and idempotency
