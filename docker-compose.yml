@@ -1,0 +1,78 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-insightguard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-insightguard}
+      POSTGRES_DB: ${POSTGRES_DB:-insightguard}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow-webserver:
+    image: apache/airflow:2.10.4-python3.11
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: &airflow-environment
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-insightguard}:${POSTGRES_PASSWORD:-insightguard}@postgres:5432/${POSTGRES_DB:-insightguard}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://host.docker.internal:5000}
+      LANDING_BUCKET: ${LANDING_BUCKET:-insightguard-landing}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-insightguard}:${POSTGRES_PASSWORD:-insightguard}@postgres:5432/${POSTGRES_DB:-insightguard}
+      _PIP_ADDITIONAL_REQUIREMENTS: "pandas==2.2.3 numpy==2.1.3 SQLAlchemy==2.0.36 psycopg2-binary==2.9.10 boto3==1.35.76 scikit-learn==1.5.2 statsmodels==0.14.4 requests==2.32.3"
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./ingestion:/opt/airflow/ingestion
+      - ./transform:/opt/airflow/transform
+      - ./models:/opt/airflow/models
+      - ./logs:/opt/airflow/logs
+    ports:
+      - "8080:8080"
+    command: webserver
+
+  airflow-init:
+    image: apache/airflow:2.10.4-python3.11
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: *airflow-environment
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./ingestion:/opt/airflow/ingestion
+      - ./transform:/opt/airflow/transform
+      - ./models:/opt/airflow/models
+      - ./logs:/opt/airflow/logs
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - airflow db migrate && airflow users create --username admin --password admin --firstname Insight --lastname Guard --role Admin --email admin@example.com || true
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.4-python3.11
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: *airflow-environment
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./ingestion:/opt/airflow/ingestion
+      - ./transform:/opt/airflow/transform
+      - ./models:/opt/airflow/models
+      - ./logs:/opt/airflow/logs
+    command: scheduler
+
+volumes:
+  postgres-data:

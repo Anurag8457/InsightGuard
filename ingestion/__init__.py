@@ -1,0 +1,2 @@
+"""InsightGuard ingestion package."""
+
