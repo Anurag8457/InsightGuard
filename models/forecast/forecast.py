@@ -6,8 +6,8 @@ import logging
 from datetime import date, datetime, timezone
 
 import pandas as pd
-from statsmodels.tsa.holtwinters import SimpleExpSmoothing
 from sqlalchemy import text
+from statsmodels.tsa.holtwinters import SimpleExpSmoothing
 
 LOGGER = logging.getLogger("insightguard.models.forecast")
 
