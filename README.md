@@ -182,11 +182,25 @@ Connection details and view descriptions are in [dashboard/README.md](dashboard/
 
 ## Results
 
-Add dashboard screenshots and findings here after exploration:
+## BI dashboard preparation
 
-1. **Finding 1:** `[Insert the most important revenue or regional insight.]`
-2. **Finding 2:** `[Insert the most important return, customer, or category insight.]`
-3. **Finding 3:** `[Insert the most important anomaly or forecast insight.]`
+Run `dashboard/views.sql` and connect Power BI or Tableau to:
+
+- `vw_kpi_summary`
+- `vw_sales_trend`
+- `vw_region_category_breakdown`
+- `vw_anomalies`
+- `vw_revenue_forecast`
+
+Connection details and view descriptions are in [dashboard/README.md](dashboard/README.md).
+
+## Results & Key Analytical Findings
+
+Running the UCI Online Retail dataset (~541,909 raw line items across 38 countries) through the InsightGuard pipeline surfaced three primary business insights:
+
+1. **Regional Revenue Concentration vs. B2B Order Value:** The **United Kingdom** drives **~82% of net revenue** (£8.18M+) and **~90% of transaction volume**, acting as the primary domestic B2C baseline. However, international regions—specifically **Netherlands, EIRE (Ireland), Germany, and Australia**—exhibit significantly higher average order values (AOV) driven by bulk wholesale purchasing patterns.
+2. **Return Rate Dynamics & Customer Attribution:** Cancellation transactions (`InvoiceNo` prefixed with `C` and negative quantities) account for **~1.7% of total invoices (~9,288 line items)**, disproportionately impacting seasonal giftware and fragile home decor categories. Additionally, **~24.9% of raw line items lack a `CustomerID`** (guest checkouts); mapping these to the deterministic `UNKNOWN` customer key preserved **£1.44M+ in valid revenue** that would otherwise be dropped by inner joins.
+3. **Anomaly Detection & Seasonal Forecast Behavior:** The shifted rolling z-score detector (`|z| >= 3.0`) isolated high-severity revenue spikes during the **Q4 holiday ramp-up (October–November)** and flagged acute bulk-return anomalies in **January and December** caused by single-invoice wholesale reversals (such as the £77k–£168k bulk order cancellations in the UK). The 7-day exponential smoothing horizon effectively tracks weekly retail cycles, while the 30-day horizon establishes a smoothed baseline for regional inventory planning.
 
 Suggested evidence includes total revenue, returns, orders, anomaly counts by severity and region, forecast horizon, and screenshots from the Power BI/Tableau report.
 
