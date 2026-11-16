@@ -1,50 +1,62 @@
-# InsightGuard — Insights Memo
+# InsightGuard — findings write-up
 
-**Date:** `[YYYY-MM-DD]`  
-**Author:** `[Name]`  
-**Dashboard version:** `[Power BI/Tableau report link or filename]`
+Fill this in after running the pipeline and exploring the dashboard. The sections below are prompts, not a rigid format — delete what doesn't apply, add what does.
 
-## Executive summary
+---
 
-`[In 2–3 sentences, summarize the business question, the strongest finding, and the recommended action.]`
+**Date:**  
+**Dashboard file/link:**
 
-## Scope and method
+---
 
-- **Dataset period:** `[Start date]` to `[End date]`
-- **Rows/orders analyzed:** `[Count]`
-- **Revenue definition:** Net positive sales after return handling.
-- **Anomaly method:** Seven-day shifted rolling z-score by region for revenue and returns; threshold: `[3.0 or chosen value]`.
-- **Forecast method:** Simple exponential smoothing with 7-day and 30-day horizons.
+## What we looked at
 
-## Finding 1 — `[Short title: revenue, region, or trend]`
+Brief description of the dataset and time range (e.g. "UCI Online Retail transactions Dec 2010 – Dec 2011, ~400k rows after validation").
 
-**Evidence:** `[Metric, date range, region/category, and dashboard view.]`
+Anomaly method: 7-day shifted rolling z-score per region, threshold |z| ≥ 3.  
+Forecast method: Simple exponential smoothing, 7-day and 30-day horizons.
 
-**Interpretation:** `[What happened and why it matters to the business.]`
+---
 
-**Recommended action:** `[Specific decision, follow-up analysis, or operational action.]`
+## Main findings
 
-## Finding 2 — `[Short title: returns, customers, or category]`
+### 1. [Finding title]
 
-**Evidence:** `[Metric, comparison, and dashboard view.]`
+What the numbers show and which dashboard view you pulled it from.
 
-**Interpretation:** `[What happened and why it matters to the business.]`
+Why it matters for the business.
 
-**Recommended action:** `[Specific decision, follow-up analysis, or operational action.]`
+What you'd do about it.
 
-## Finding 3 — `[Short title: anomaly or forecast]`
+---
 
-**Evidence:** `[Region, anomaly date/severity or forecast horizon, and dashboard view.]`
+### 2. [Finding title]
 
-**Interpretation:** `[What happened, whether it is signal or data quality, and why it matters.]`
+What the numbers show and which dashboard view you pulled it from.
 
-**Recommended action:** `[Specific decision, alert threshold change, or investigation.]`
+Why it matters for the business.
+
+What you'd do about it.
+
+---
+
+### 3. [Finding title — usually an anomaly or forecast observation]
+
+What the detector flagged and whether it looks like a real signal or a data artefact.
+
+What you'd do about it.
+
+---
 
 ## Caveats
 
-`[Note missing customer IDs, heuristic categories, historical-only data, sparse regions, or any other limitation that affects interpretation.]`
+- ~25% of rows have no CustomerID (guest checkouts) — mapped to UNKNOWN dimension key, revenue is counted but customer-level analysis is incomplete.
+- Product categories are keyword-based heuristics, not from a real taxonomy.
+- Dataset is historical — no live feed, so forecasts are illustrative rather than operational.
+- Sparse regions (e.g. RSA, Bahrain) have too few data points for reliable anomaly baselines.
 
-## Closing recommendation
+---
 
-`[One paragraph tying the three findings to a prioritized next step.]`
+## Bottom line
 
+One paragraph. What's the single most important thing to act on, and what's the next analysis step if you had more time?

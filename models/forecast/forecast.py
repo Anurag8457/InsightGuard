@@ -1,6 +1,4 @@
-"""Regional revenue forecasts using simple exponential smoothing."""
-
-from __future__ import annotations
+"""Forecast regional revenue using simple exponential smoothing."""
 
 import logging
 from datetime import date, datetime, timezone
@@ -11,63 +9,60 @@ from sqlalchemy import text
 LOGGER = logging.getLogger("insightguard.models.forecast")
 
 
-def _simple_exponential_smoothing(series: pd.Series, horizon: int) -> pd.Series:
-    """Forecast a level series using the standard single-parameter update."""
+def _ses_forecast(series, horizon):
+    """Basic SES — compute alpha from series length, then project a flat forecast."""
     alpha = min(1.0, max(0.01, 2.0 / (len(series) + 1)))
     level = float(series.iloc[0])
-    for value in series.iloc[1:]:
-        level = alpha * float(value) + (1.0 - alpha) * level
-    index = pd.date_range(series.index[-1] + pd.Timedelta(days=1), periods=horizon, freq="D")
-    return pd.Series(level, index=index)
+    for val in series.iloc[1:]:
+        level = alpha * float(val) + (1.0 - alpha) * level
+    idx = pd.date_range(series.index[-1] + pd.Timedelta(days=1), periods=horizon, freq="D")
+    return pd.Series(level, index=idx)
 
 
-def forecast_revenue(
-    daily_metrics: pd.DataFrame,
-    *,
-    horizons: tuple[int, ...] = (7, 30),
-    run_date: date | None = None,
-) -> pd.DataFrame:
-    """Forecast daily regional revenue for the requested horizons."""
+def forecast_revenue(daily_metrics, *, horizons=(7, 30), run_date=None):
+    """Generate forecasts for each region at each horizon."""
     required = {"metric_date", "region_key", "region_name", "revenue"}
     missing = required.difference(daily_metrics.columns)
     if missing:
-        raise ValueError(f"Missing forecast columns: {', '.join(sorted(missing))}")
-    if not horizons or any(horizon <= 0 for horizon in horizons):
-        raise ValueError("horizons must contain positive day counts")
+        raise ValueError(f"Missing columns for forecast: {', '.join(sorted(missing))}")
+    if not horizons or any(h <= 0 for h in horizons):
+        raise ValueError("horizons must be positive integers")
 
-    source = daily_metrics.copy()
-    source["metric_date"] = pd.to_datetime(source["metric_date"])
-    source["revenue"] = pd.to_numeric(source["revenue"], errors="coerce").fillna(0.0)
+    src = daily_metrics.copy()
+    src["metric_date"] = pd.to_datetime(src["metric_date"])
+    src["revenue"] = pd.to_numeric(src["revenue"], errors="coerce").fillna(0.0)
+
     rows = []
-    max_horizon = max(horizons)
-    for (region_key, region_name), group in source.groupby(["region_key", "region_name"], sort=True):
-        series = (
-            group.set_index("metric_date")["revenue"]
-            .resample("D")
-            .sum()
+    max_h = max(horizons)
+
+    for (rk, rn), grp in src.groupby(["region_key", "region_name"], sort=True):
+        ts = (
+            grp.set_index("metric_date")["revenue"]
+            .resample("D").sum()
             .asfreq("D", fill_value=0.0)
         )
-        if series.empty:
+        if ts.empty:
             continue
-        predictions = _simple_exponential_smoothing(series, max_horizon)
-        predictions = predictions.clip(lower=0.0)
-        for horizon in horizons:
-            for forecast_date, value in predictions.iloc[:horizon].items():
-                rows.append(
-                    {
-                        "forecast_run_date": run_date or series.index.max().date(),
-                        "forecast_date": forecast_date.date(),
-                        "region_key": region_key,
-                        "region_name": region_name,
-                        "horizon_days": horizon,
-                        "forecast_revenue": round(float(value), 2),
-                        "model_name": "simple_exponential_smoothing",
-                    }
-                )
+
+        preds = _ses_forecast(ts, max_h)
+        preds = preds.clip(lower=0.0)
+
+        for h in horizons:
+            for fc_date, val in preds.iloc[:h].items():
+                rows.append({
+                    "forecast_run_date": run_date or ts.index.max().date(),
+                    "forecast_date": fc_date.date(),
+                    "region_key": rk,
+                    "region_name": rn,
+                    "horizon_days": h,
+                    "forecast_revenue": round(float(val), 2),
+                    "model_name": "simple_exponential_smoothing",
+                })
+
     return pd.DataFrame(rows)
 
 
-def create_forecast_table(engine) -> None:
+def create_forecast_table(engine):
     ddl = """
     CREATE TABLE IF NOT EXISTS revenue_forecasts (
         forecast_run_date DATE NOT NULL,
@@ -81,43 +76,48 @@ def create_forecast_table(engine) -> None:
         PRIMARY KEY (forecast_run_date, forecast_date, region_key, horizon_days)
     );
     """
-    with engine.begin() as connection:
-        connection.execute(text(ddl))
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
 
 
-def persist_forecasts(engine, forecasts: pd.DataFrame, run_date: date) -> None:
+def persist_forecasts(engine, forecasts, run_date):
     if forecasts.empty:
         return
     create_forecast_table(engine)
+
     rows = forecasts.copy()
     rows["created_at"] = datetime.now(timezone.utc)
     records = rows.astype(object).where(pd.notna(rows), None).to_dict(orient="records")
-    for record in records:
-        if isinstance(record["created_at"], pd.Timestamp):
-            record["created_at"] = record["created_at"].to_pydatetime()
-    columns = [
+    for rec in records:
+        if isinstance(rec["created_at"], pd.Timestamp):
+            rec["created_at"] = rec["created_at"].to_pydatetime()
+
+    cols = [
         "forecast_run_date", "forecast_date", "region_key", "region_name", "horizon_days",
         "forecast_revenue", "model_name", "created_at",
     ]
-    with engine.begin() as connection:
-        connection.execute(text("DELETE FROM revenue_forecasts WHERE forecast_run_date = :run_date"), {"run_date": run_date})
-        connection.execute(
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM revenue_forecasts WHERE forecast_run_date = :rd"),
+            {"rd": run_date},
+        )
+        conn.execute(
             text(
-                f"INSERT INTO revenue_forecasts ({', '.join(columns)}) "
-                f"VALUES ({', '.join(':' + c for c in columns)}) "
+                f"INSERT INTO revenue_forecasts ({', '.join(cols)}) "
+                f"VALUES ({', '.join(':' + c for c in cols)}) "
                 "ON CONFLICT (forecast_run_date, forecast_date, region_key, horizon_days) DO UPDATE SET "
-                + ", ".join(f"{c}=EXCLUDED.{c}" for c in columns[3:])
+                + ", ".join(f"{c}=EXCLUDED.{c}" for c in cols[3:])
             ),
             records,
         )
 
 
-def run_forecast(engine, *, run_date: date | None = None) -> pd.DataFrame:
+def run_forecast(engine, *, run_date=None):
     from models.anomaly.detect import fetch_daily_metrics
 
     metrics = fetch_daily_metrics(engine, run_date)
     forecasts = forecast_revenue(metrics, run_date=run_date)
-    effective_run_date = run_date or pd.to_datetime(metrics["metric_date"]).max().date()
-    persist_forecasts(engine, forecasts, effective_run_date)
-    LOGGER.info("Persisted %d revenue forecast rows", len(forecasts))
+    effective_date = run_date or pd.to_datetime(metrics["metric_date"]).max().date()
+    persist_forecasts(engine, forecasts, effective_date)
+    LOGGER.info("Wrote %d forecast rows", len(forecasts))
     return forecasts

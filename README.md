@@ -1,17 +1,17 @@
 # InsightGuard
 
-InsightGuard is a cloud-native sales analytics and anomaly-detection pipeline for retail transactions. It turns raw e-commerce line items into an auditable landing zone, a PostgreSQL star schema, regional anomaly flags, revenue forecasts, and BI-ready views for Power BI or Tableau.
+Sales analytics + anomaly detection pipeline built around the UCI Online Retail dataset. Takes raw CSV transaction data, validates and lands it in S3, transforms it into a star schema in PostgreSQL, runs anomaly detection (rolling z-scores) and revenue forecasting (exponential smoothing), then exposes everything through SQL views that Power BI / Tableau can connect to.
 
-## Problem statement
+## Why this exists
 
-Retail teams need to answer two questions reliably:
+I wanted a proper end-to-end data pipeline project — not just a notebook that reads a CSV and makes some charts. The idea is two questions every retail team cares about:
 
-1. What happened to sales, returns, customers, products, and regions over time?
-2. Which daily revenue or return patterns deserve investigation before they become business problems?
+1. What's actually happening with sales, returns, products, and regions over time?
+2. Are there any weird revenue/return spikes worth looking into before they become real problems?
 
-InsightGuard addresses both with a reproducible batch pipeline. It uses the UCI Online Retail data shape: invoice number, product code, description, quantity, invoice date, unit price, customer, and country. The source dataset has no native product category, so the BI layer exposes a documented description-keyword heuristic that can later be replaced with a maintained taxonomy.
+The UCI dataset doesn't have product categories, so the BI layer uses a keyword-based heuristic on descriptions. It's hacky but it works — you'd swap it out for a real taxonomy in production.
 
-## Architecture
+## How it works
 
 ```mermaid
 flowchart LR
@@ -36,81 +36,72 @@ flowchart LR
     N -. orchestrates .-> I
 ```
 
-### Local-to-cloud mapping
+Locally everything runs against Moto (mock S3) and a real Postgres instance. In production you'd swap Moto for actual S3, Postgres for Redshift, etc.
 
-| Local component | AWS-pattern equivalent | Purpose |
+| Local | Production equivalent | What it does |
 |---|---|---|
-| Persistent Moto server | Amazon S3 | Object landing and curated artifacts |
-| Local PostgreSQL | Amazon Redshift or Athena-facing warehouse layer | Dimensional analytics tables |
-| Airflow | Amazon MWAA | Scheduling, retries, and dependencies |
-| Python/pandas | AWS Glue or containerized jobs | Validation and transformation |
-| Power BI/Tableau | BI service connected to warehouse | Reporting and exploration |
+| Moto server | S3 | Object storage for raw + curated data |
+| PostgreSQL | Redshift / Athena | Warehouse layer |
+| Airflow (docker-compose) | MWAA | Orchestration |
+| pandas | Glue / containerized jobs | Transform logic |
 
-## Repository layout
+## Repo structure
 
 ```text
-ingestion/                 Source acquisition, validation, and landing
-transform/                 Cleaning, star schema, and PostgreSQL loading
-models/anomaly/            Rolling z-score anomaly detection
-models/forecast/           7/30-day exponential-smoothing forecasts
-dags/                      Airflow orchestration
-dashboard/views.sql        BI-facing PostgreSQL views
-dashboard/README.md        Power BI/Tableau connection guide
-tests/                     Ingestion, transformation, and model tests
-docs/                      Project and insights documentation
+ingestion/          Download, validate, land raw data in S3
+transform/          Cleaning + star schema build + Postgres load
+models/anomaly/     Rolling z-score anomaly flagging
+models/forecast/    Exponential smoothing forecasts (7d + 30d)
+dags/               Airflow DAG
+dashboard/          SQL views + BI connection docs
+tests/              pytest suite
+docs/               Write-up template
 ```
 
 ## Dataset
 
-The default source is a public CSV conversion of the UCI Online Retail dataset. The ingestion layer also accepts a local CSV or XLSX file through `--source`. Expected columns are:
+Uses the [UCI Online Retail](https://archive.ics.uci.edu/ml/datasets/Online+Retail) dataset (or any CSV/XLSX with the same columns). You can also point `--source` at a local file.
 
-`InvoiceNo`, `StockCode`, `Description`, `Quantity`, `InvoiceDate`, `UnitPrice`, `CustomerID`, and `Country`.
+Expected columns: `InvoiceNo`, `StockCode`, `Description`, `Quantity`, `InvoiceDate`, `UnitPrice`, `CustomerID`, `Country`.
 
-Returns are retained as negative-quantity transactions. Missing `CustomerID` is allowed because it occurs in the source data; unknown customers receive a stable `UNKNOWN` dimension member during transformation.
+Negative quantities = returns. Missing `CustomerID` is fine (it's common in the source data) — those get mapped to an `UNKNOWN` dimension key during transform.
 
-## Local setup
+## Getting started
 
-The core pipeline runs with a local PostgreSQL server and a persistent Moto S3-compatible server.
-
-### 1. Install Python dependencies
-
-Use Python 3.11:
+Need Python 3.11 and a running PostgreSQL instance.
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env           # Windows: copy .env.example .env
+cp .env.example .env        # Windows: copy .env.example .env
 ```
 
-### 2. Start local services
-
-Create a PostgreSQL database named `insightguard`, then start a persistent Moto endpoint in a separate terminal:
+Fire up a Moto server in another terminal (or use `USE_MOTO_S3=true` for quick tests):
 
 ```bash
 moto_server -H 0.0.0.0 -p 5000
 ```
 
-Set the values from `.env`, especially:
-
-```text
+Make sure `.env` has the right values:
+```
 S3_ENDPOINT_URL=http://localhost:5000
 USE_MOTO_S3=false
 DATABASE_URL=postgresql+psycopg2://insightguard:insightguard@localhost:5432/insightguard
 ```
 
-`USE_MOTO_S3=true` is intended for isolated tests or a single-process smoke run. Airflow task boundaries require the persistent Moto server so objects survive between tasks.
+> **Note:** `USE_MOTO_S3=true` spins up an in-process mock — fine for tests but won't work with Airflow since objects don't persist across task boundaries.
 
-### 3. Run the pipeline stages independently
+### Running the pipeline
 
-Choose an ingestion partition date, for example `2026-07-21`:
+Pick a partition date and run:
 
 ```bash
 python -m ingestion.ingest --ingestion-date 2026-07-21
 python -m transform.transform --ingestion-date 2026-07-21
 ```
 
-The transform stage reads the validated landing object, writes curated table artifacts, and loads PostgreSQL. To run it from a local validated CSV instead:
+Or if you already have a validated CSV locally:
 
 ```bash
 python -m transform.transform \
@@ -119,102 +110,80 @@ python -m transform.transform \
   --database-url "$DATABASE_URL"
 ```
 
-Apply the BI views with:
+Then apply the BI views:
 
 ```bash
 psql "$DATABASE_URL" -f dashboard/views.sql
 ```
 
-## Data flow and idempotency
+## How data flows
 
-Each ingestion run writes:
+Each run creates a partitioned structure in S3:
 
-```text
-landing/ingestion_date=YYYY-MM-DD/raw/<source>
+```
+landing/ingestion_date=YYYY-MM-DD/raw/<source file>
 landing/ingestion_date=YYYY-MM-DD/validated/transactions.csv
 landing/ingestion_date=YYYY-MM-DD/rejected/rejected_rows.csv
 landing/ingestion_date=YYYY-MM-DD/manifest.json
 ```
 
-The raw file is preserved unchanged. Validation produces accepted and rejected outputs with rejection reasons and row counts in the manifest. Transformation writes curated star-schema CSV artifacts under `curated/ingestion_date=YYYY-MM-DD/`.
+Raw file is kept as-is for auditability. Rejected rows include a reason column so you can see what got filtered out.
 
-Warehouse dimension keys are deterministic hashes of stable business identifiers. Re-running a partition deletes and reloads only that partition’s fact rows, while dimension inserts use conflict protection. Anomaly flags are replaced for their metric date range, and forecasts are replaced for the same forecast run date.
+Dimension keys are SHA1-based so they're deterministic — re-running the same partition is safe (it deletes + reloads facts, and dimensions use `ON CONFLICT DO NOTHING`).
 
-## Warehouse and model outputs
+## What's in the warehouse
 
-- `fact_sales` — transaction grain with revenue, returns, quantities, dates, regions, and stable dimension keys.
-- `dim_product`, `dim_customer`, `dim_date`, `dim_region` — reporting dimensions.
-- `anomaly_flags` — regional daily metrics, rolling baselines, z-scores, anomaly type, and severity.
-- `revenue_forecasts` — regional daily forecasts for 7-day and 30-day horizons.
+- **fact_sales** — one row per line item. Has revenue, return amounts, quantities, and FK references to all dims.
+- **dim_product**, **dim_customer**, **dim_date**, **dim_region** — standard SCD Type 1 dimensions.
+- **anomaly_flags** — daily metrics per region with rolling baselines, z-scores, severity labels.
+- **revenue_forecasts** — 7-day and 30-day horizon predictions per region.
 
-## Orchestration
+## Airflow DAG
 
-`dags/insightguard_daily.py` runs daily at 02:00 UTC:
+Runs daily at 02:00 UTC: `ingestion → transform → load → anomaly_detection → forecast`
 
-```text
-ingestion → transform → load → anomaly_detection → forecast
-```
+2 retries, 5 min between. There's a failure callback that hits a webhook URL if you set `FAILURE_WEBHOOK_URL` (otherwise just logs it).
 
-Tasks retry twice with five-minute delays. The failure callback logs a notification stub and optionally posts to `FAILURE_WEBHOOK_URL`, which can later be replaced with a Slack or email integration.
-
-## Testing and CI
-
-Run locally:
+## Tests
 
 ```bash
 ruff check .
 pytest -q
 ```
 
-GitHub Actions runs the same Ruff and pytest gates on every push and pull request. Tests cover Moto S3 round trips, schema validation, transformation cleaning, stable star-schema keys, anomaly detection, forecasting horizons, and model artifact idempotency smoke paths.
+CI runs both on every push/PR. Tests cover S3 round-trips, validation, transform logic, stable key generation, anomaly detection, and forecast outputs.
 
-## BI dashboard preparation
+## Dashboard
 
-Run `dashboard/views.sql` and connect Power BI or Tableau to:
+After running `dashboard/views.sql`, connect Power BI or Tableau to these views:
 
-- `vw_kpi_summary`
-- `vw_sales_trend`
-- `vw_region_category_breakdown`
-- `vw_anomalies`
-- `vw_revenue_forecast`
+- `vw_kpi_summary` — top-level numbers
+- `vw_sales_trend` — daily trends by region
+- `vw_region_category_breakdown` — revenue by region × product category
+- `vw_anomalies` — flagged anomalies with z-scores
+- `vw_revenue_forecast` — forecast output
 
-Connection details and view descriptions are in [dashboard/README.md](dashboard/README.md). The actual dashboard is intentionally left to the portfolio author.
+See [dashboard/README.md](dashboard/README.md) for connection details.
 
-## Results
+## Key findings from the UCI dataset
 
-## BI dashboard preparation
+Running the full dataset (~541k rows, 38 countries) through the pipeline:
 
-Run `dashboard/views.sql` and connect Power BI or Tableau to:
+- **UK dominates** — roughly 80%+ of revenue and most of the transaction volume. But countries like Netherlands, Ireland, Germany have noticeably higher average order values (wholesale/bulk buyers).
+- **Returns are small but concentrated** — cancellations (C-prefixed invoices) are ~1.7% of invoices but they cluster around seasonal giftware and fragile items. About 25% of rows have no CustomerID (guest checkouts) — keeping those as `UNKNOWN` preserves ~£1.4M in revenue that'd be lost with a naive inner join.
+- **Anomaly detector picks up real things** — the z-score flagging catches Q4 holiday spikes and those big wholesale cancellation reversals (some single invoices worth £70k-170k). The 7-day smoothing tracks weekly cycles well; the 30-day gives a steadier baseline.
 
-- `vw_kpi_summary`
-- `vw_sales_trend`
-- `vw_region_category_breakdown`
-- `vw_anomalies`
-- `vw_revenue_forecast`
+## Design choices
 
-Connection details and view descriptions are in [dashboard/README.md](dashboard/README.md).
+- Raw data preserved before any validation (replay + audit)
+- Deterministic dimension keys → safe re-runs
+- Shifted rolling z-score so today's value doesn't leak into its own baseline
+- Exponential smoothing over ARIMA because it's simpler to explain and the data doesn't really need seasonality decomposition
+- Dashboard lives in Power BI/Tableau, not Python — the pipeline just exposes views
 
-## Results & Key Analytical Findings
+## Known limitations
 
-Running the UCI Online Retail dataset (~541,909 raw line items across 38 countries) through the InsightGuard pipeline surfaced three primary business insights:
-
-1. **Regional Revenue Concentration vs. B2B Order Value:** The **United Kingdom** drives **~82% of net revenue** (£8.18M+) and **~90% of transaction volume**, acting as the primary domestic B2C baseline. However, international regions—specifically **Netherlands, EIRE (Ireland), Germany, and Australia**—exhibit significantly higher average order values (AOV) driven by bulk wholesale purchasing patterns.
-2. **Return Rate Dynamics & Customer Attribution:** Cancellation transactions (`InvoiceNo` prefixed with `C` and negative quantities) account for **~1.7% of total invoices (~9,288 line items)**, disproportionately impacting seasonal giftware and fragile home decor categories. Additionally, **~24.9% of raw line items lack a `CustomerID`** (guest checkouts); mapping these to the deterministic `UNKNOWN` customer key preserved **£1.44M+ in valid revenue** that would otherwise be dropped by inner joins.
-3. **Anomaly Detection & Seasonal Forecast Behavior:** The shifted rolling z-score detector (`|z| >= 3.0`) isolated high-severity revenue spikes during the **Q4 holiday ramp-up (October–November)** and flagged acute bulk-return anomalies in **January and December** caused by single-invoice wholesale reversals (such as the £77k–£168k bulk order cancellations in the UK). The 7-day exponential smoothing horizon effectively tracks weekly retail cycles, while the 30-day horizon establishes a smoothed baseline for regional inventory planning.
-
-Suggested evidence includes total revenue, returns, orders, anomaly counts by severity and region, forecast horizon, and screenshots from the Power BI/Tableau report.
-
-## Interview-ready design decisions
-
-- Preserve raw data before validation to support auditability and replay.
-- Use deterministic dimension keys and partition-level replacement for safe reruns.
-- Use shifted rolling z-scores for explainable anomaly detection without leakage.
-- Use exponential smoothing for a transparent baseline forecast.
-- Keep the dashboard in Power BI/Tableau and expose stable SQL views rather than coupling reporting to Python.
-
-## Limitations and next steps
-
-- The source dataset is historical and not a live retail feed.
-- Currency is standardized to GBP because the source provides a single sterling price field.
-- Product categories are heuristic until a maintained taxonomy is supplied.
-- A production deployment would add secrets management, data-quality alerts, partition retention, warehouse roles, and managed AWS services.
+- Historical dataset, not a live feed
+- Everything is in GBP (single currency in source)
+- Product categories are just keyword matching on descriptions
+- No secrets management, data quality alerts, or partition retention — would need those for a real deployment

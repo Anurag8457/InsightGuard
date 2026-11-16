@@ -1,6 +1,4 @@
-"""Clean landed transactions and load an idempotent PostgreSQL star schema."""
-
-from __future__ import annotations
+"""Transform landed transactions into a star schema and load into Postgres."""
 
 import argparse
 import hashlib
@@ -24,17 +22,19 @@ STAR_TABLES = (
 )
 
 
-def _stable_key(prefix: str, value: object) -> str:
+def _stable_key(prefix, value):
+    """Hash-based key so dimension IDs are deterministic across runs."""
     digest = hashlib.sha1(str(value).encode("utf-8")).hexdigest()[:16]
     return f"{prefix}_{digest}"
 
 
-def country_to_region(country: str) -> str:
-    """Map source countries to a small, explainable reporting geography."""
-    normalized = country.strip().lower()
-    if normalized in {"united kingdom", "uk", "great britain"}:
+def country_to_region(country):
+    """Bucket countries into a handful of reporting regions.
+    Nothing fancy — just enough granularity for the dashboard."""
+    c = country.strip().lower()
+    if c in {"united kingdom", "uk", "great britain"}:
         return "United Kingdom"
-    if normalized in {
+    if c in {
         "austria", "belgium", "cyprus", "denmark", "eire", "finland", "france",
         "germany", "greece", "iceland", "italy", "malta", "netherlands", "norway",
         "poland", "portugal", "spain", "sweden", "switzerland",
@@ -43,8 +43,8 @@ def country_to_region(country: str) -> str:
     return "Other"
 
 
-def clean_transactions(frame: pd.DataFrame, ingestion_date: date) -> pd.DataFrame:
-    """Normalize source types and remove unusable or exact duplicate rows."""
+def clean_transactions(frame, ingestion_date):
+    """Normalize types, drop dupes, remove zero-qty rows, compute derived columns."""
     required = {
         "InvoiceNo", "StockCode", "Description", "Quantity", "InvoiceDate",
         "UnitPrice", "CustomerID", "Country",
@@ -53,43 +53,53 @@ def clean_transactions(frame: pd.DataFrame, ingestion_date: date) -> pd.DataFram
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
 
-    cleaned = frame.copy()
-    cleaned = cleaned.drop_duplicates().reset_index(drop=True)
-    cleaned["InvoiceNo"] = cleaned["InvoiceNo"].astype("string").str.strip()
-    cleaned["StockCode"] = cleaned["StockCode"].astype("string").str.strip()
-    cleaned["Description"] = cleaned["Description"].fillna("Unknown product").astype("string").str.strip()
-    cleaned["Country"] = cleaned["Country"].fillna("Unknown").astype("string").str.strip()
-    cleaned["Quantity"] = pd.to_numeric(cleaned["Quantity"], errors="coerce")
-    cleaned["UnitPrice"] = pd.to_numeric(cleaned["UnitPrice"], errors="coerce")
-    cleaned["InvoiceDate"] = pd.to_datetime(cleaned["InvoiceDate"], errors="coerce", dayfirst=True)
-    cleaned["CustomerID"] = pd.to_numeric(cleaned["CustomerID"], errors="coerce").astype("Int64")
+    df = frame.copy()
+    df = df.drop_duplicates().reset_index(drop=True)
 
-    valid = (
-        cleaned["InvoiceNo"].notna()
-        & cleaned["StockCode"].notna()
-        & cleaned["InvoiceDate"].notna()
-        & cleaned["Quantity"].notna()
-        & cleaned["UnitPrice"].notna()
-        & cleaned["UnitPrice"].ge(0)
-        & cleaned["Quantity"].ne(0)
+    # normalize string columns
+    df["InvoiceNo"] = df["InvoiceNo"].astype("string").str.strip()
+    df["StockCode"] = df["StockCode"].astype("string").str.strip()
+    df["Description"] = df["Description"].fillna("Unknown product").astype("string").str.strip()
+    df["Country"] = df["Country"].fillna("Unknown").astype("string").str.strip()
+
+    # coerce numerics
+    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
+    df["UnitPrice"] = pd.to_numeric(df["UnitPrice"], errors="coerce")
+    df["InvoiceDate"] = pd.to_datetime(df["InvoiceDate"], errors="coerce", dayfirst=True)
+    df["CustomerID"] = pd.to_numeric(df["CustomerID"], errors="coerce").astype("Int64")
+
+    # filter out rows we can't use
+    keep = (
+        df["InvoiceNo"].notna()
+        & df["StockCode"].notna()
+        & df["InvoiceDate"].notna()
+        & df["Quantity"].notna()
+        & df["UnitPrice"].notna()
+        & df["UnitPrice"].ge(0)
+        & df["Quantity"].ne(0)
     )
-    cleaned = cleaned.loc[valid].copy()
-    cleaned["InvoiceDate"] = cleaned["InvoiceDate"].dt.tz_localize(None)
-    cleaned["ingestion_date"] = pd.Timestamp(ingestion_date)
-    cleaned["currency_code"] = "GBP"
-    cleaned["region_name"] = cleaned["Country"].map(country_to_region)
-    cleaned["gross_sales"] = (cleaned["Quantity"] * cleaned["UnitPrice"]).round(2)
-    cleaned["return_amount"] = cleaned["gross_sales"].where(cleaned["Quantity"].lt(0), 0).abs()
-    cleaned["net_sales"] = cleaned["gross_sales"].where(cleaned["Quantity"].ge(0), 0)
-    cleaned["is_return"] = cleaned["Quantity"].lt(0) | cleaned["InvoiceNo"].str.upper().str.startswith("C")
-    return cleaned.reset_index(drop=True)
+    df = df.loc[keep].copy()
+
+    df["InvoiceDate"] = df["InvoiceDate"].dt.tz_localize(None)
+    df["ingestion_date"] = pd.Timestamp(ingestion_date)
+    df["currency_code"] = "GBP"
+    df["region_name"] = df["Country"].map(country_to_region)
+
+    # revenue calculations
+    df["gross_sales"] = (df["Quantity"] * df["UnitPrice"]).round(2)
+    df["return_amount"] = df["gross_sales"].where(df["Quantity"].lt(0), 0).abs()
+    df["net_sales"] = df["gross_sales"].where(df["Quantity"].ge(0), 0)
+    df["is_return"] = df["Quantity"].lt(0) | df["InvoiceNo"].str.upper().str.startswith("C")
+
+    return df.reset_index(drop=True)
 
 
-def build_star_schema(cleaned: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """Build dimension and fact frames with deterministic keys for safe reruns."""
+def build_star_schema(cleaned):
+    """Take the cleaned dataframe and split it into dims + fact table."""
     if cleaned.empty:
         raise ValueError("No valid transactions remain after cleaning")
 
+    # dim_product
     products = (
         cleaned[["StockCode", "Description"]]
         .drop_duplicates("StockCode")
@@ -99,6 +109,7 @@ def build_star_schema(cleaned: pd.DataFrame) -> dict[str, pd.DataFrame]:
     )
     products.insert(0, "product_key", products["stock_code"].map(lambda x: _stable_key("prod", x)))
 
+    # dim_customer — UNKNOWN for missing customer IDs
     customers = (
         cleaned[["CustomerID", "Country"]]
         .assign(customer_id=lambda d: d["CustomerID"].astype("string").fillna("UNKNOWN"))
@@ -110,6 +121,7 @@ def build_star_schema(cleaned: pd.DataFrame) -> dict[str, pd.DataFrame]:
     )
     customers.insert(0, "customer_key", customers["customer_id"].map(lambda x: _stable_key("cust", x)))
 
+    # dim_region
     regions = (
         cleaned[["region_name"]]
         .drop_duplicates()
@@ -118,6 +130,7 @@ def build_star_schema(cleaned: pd.DataFrame) -> dict[str, pd.DataFrame]:
     )
     regions.insert(0, "region_key", regions["region_name"].map(lambda x: _stable_key("region", x)))
 
+    # dim_date
     dates = pd.DataFrame({"full_date": cleaned["InvoiceDate"].dt.normalize().drop_duplicates()})
     dates = dates.sort_values("full_date").reset_index(drop=True)
     dates.insert(0, "date_key", dates["full_date"].dt.strftime("%Y%m%d").astype(int))
@@ -129,33 +142,38 @@ def build_star_schema(cleaned: pd.DataFrame) -> dict[str, pd.DataFrame]:
     dates["day_of_month"] = dates["full_date"].dt.day
     dates["full_date"] = dates["full_date"].dt.date
 
-    facts = cleaned.rename(
-        columns={
-            "InvoiceNo": "invoice_no",
-            "StockCode": "stock_code",
-            "CustomerID": "customer_id_raw",
-            "InvoiceDate": "invoice_datetime",
-            "UnitPrice": "unit_price",
-            "Quantity": "quantity",
-        }
-    ).copy()
+    # fact_sales
+    facts = cleaned.rename(columns={
+        "InvoiceNo": "invoice_no",
+        "StockCode": "stock_code",
+        "CustomerID": "customer_id_raw",
+        "InvoiceDate": "invoice_datetime",
+        "UnitPrice": "unit_price",
+        "Quantity": "quantity",
+    }).copy()
+
     facts["product_key"] = facts["stock_code"].map(lambda x: _stable_key("prod", x))
-    facts["customer_key"] = facts["customer_id_raw"].astype("string").fillna("UNKNOWN").map(lambda x: _stable_key("cust", x))
+    facts["customer_key"] = (
+        facts["customer_id_raw"].astype("string").fillna("UNKNOWN")
+        .map(lambda x: _stable_key("cust", x))
+    )
     facts["region_key"] = facts["region_name"].map(lambda x: _stable_key("region", x))
     facts["date_key"] = facts["invoice_datetime"].dt.strftime("%Y%m%d").astype(int)
+
+    # build a composite transaction ID for dedup
     facts["transaction_id"] = facts.apply(
         lambda row: _stable_key(
             "txn", f"{row['invoice_no']}|{row['stock_code']}|{row['invoice_datetime']}|{row['quantity']}|{row['unit_price']}"
         ),
         axis=1,
     )
-    facts = facts[
-        [
-            "transaction_id", "invoice_no", "product_key", "customer_key", "date_key", "region_key",
-            "quantity", "unit_price", "currency_code", "gross_sales", "return_amount", "net_sales",
-            "is_return", "ingestion_date",
-        ]
+
+    fact_cols = [
+        "transaction_id", "invoice_no", "product_key", "customer_key", "date_key", "region_key",
+        "quantity", "unit_price", "currency_code", "gross_sales", "return_amount", "net_sales",
+        "is_return", "ingestion_date",
     ]
+    facts = facts[fact_cols]
     facts["ingestion_date"] = pd.to_datetime(facts["ingestion_date"]).dt.date
 
     return {
@@ -167,88 +185,65 @@ def build_star_schema(cleaned: pd.DataFrame) -> dict[str, pd.DataFrame]:
     }
 
 
-def read_landing_transactions(
-    bucket: str,
-    ingestion_date: date,
-    *,
-    endpoint_url: str | None = None,
-) -> pd.DataFrame:
-    """Read the validated transaction object for one landing partition."""
-    client = boto3.client(
+def _make_s3_client(endpoint_url=None):
+    return boto3.client(
         "s3",
         endpoint_url=endpoint_url or os.getenv("S3_ENDPOINT_URL"),
         region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
         aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "test"),
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
     )
+
+
+def read_landing_transactions(bucket, ingestion_date, *, endpoint_url=None):
+    """Pull the validated CSV from the landing partition in S3."""
+    client = _make_s3_client(endpoint_url)
     key = f"landing/ingestion_date={ingestion_date.isoformat()}/validated/transactions.csv"
-    response = client.get_object(Bucket=bucket, Key=key)
-    return pd.read_csv(response["Body"])
+    resp = client.get_object(Bucket=bucket, Key=key)
+    return pd.read_csv(resp["Body"])
 
 
-def write_star_schema_to_s3(
-    star_schema: dict[str, pd.DataFrame],
-    bucket: str,
-    ingestion_date: date,
-    *,
-    endpoint_url: str | None = None,
-) -> list[str]:
-    """Persist transformed tables as CSV artifacts for a later load task."""
-    client = boto3.client(
-        "s3",
-        endpoint_url=endpoint_url or os.getenv("S3_ENDPOINT_URL"),
-        region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "test"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
-    )
+def write_star_schema_to_s3(star_schema, bucket, ingestion_date, *, endpoint_url=None):
+    """Dump transformed tables as CSVs into the curated partition."""
+    client = _make_s3_client(endpoint_url)
     try:
         client.head_bucket(Bucket=bucket)
     except client.exceptions.ClientError:
         client.create_bucket(Bucket=bucket)
 
     keys = []
-    partition = f"curated/ingestion_date={ingestion_date.isoformat()}"
-    for table_name, frame in star_schema.items():
-        key = f"{partition}/{table_name}.csv"
+    prefix = f"curated/ingestion_date={ingestion_date.isoformat()}"
+    for name, df in star_schema.items():
+        key = f"{prefix}/{name}.csv"
         client.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=frame.to_csv(index=False).encode("utf-8"),
+            Bucket=bucket, Key=key,
+            Body=df.to_csv(index=False).encode("utf-8"),
             ContentType="text/csv",
         )
         keys.append(key)
     return keys
 
 
-def read_star_schema_from_s3(
-    bucket: str,
-    ingestion_date: date,
-    *,
-    endpoint_url: str | None = None,
-) -> dict[str, pd.DataFrame]:
-    """Read transformed table artifacts written by the transform task."""
-    client = boto3.client(
-        "s3",
-        endpoint_url=endpoint_url or os.getenv("S3_ENDPOINT_URL"),
-        region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "test"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
-    )
-    partition = f"curated/ingestion_date={ingestion_date.isoformat()}"
-    star_schema = {}
-    for table_name in ("dim_product", "dim_customer", "dim_date", "dim_region", "fact_sales"):
-        response = client.get_object(Bucket=bucket, Key=f"{partition}/{table_name}.csv")
-        frame = pd.read_csv(response["Body"])
-        if table_name == "dim_date":
-            frame["full_date"] = pd.to_datetime(frame["full_date"]).dt.date
-        if table_name == "fact_sales":
-            frame["ingestion_date"] = pd.to_datetime(frame["ingestion_date"]).dt.date
-        star_schema[table_name] = frame
-    return star_schema
+def read_star_schema_from_s3(bucket, ingestion_date, *, endpoint_url=None):
+    """Read back the curated CSVs written by write_star_schema_to_s3."""
+    client = _make_s3_client(endpoint_url)
+    prefix = f"curated/ingestion_date={ingestion_date.isoformat()}"
+    result = {}
+    for tbl in ("dim_product", "dim_customer", "dim_date", "dim_region", "fact_sales"):
+        resp = client.get_object(Bucket=bucket, Key=f"{prefix}/{tbl}.csv")
+        df = pd.read_csv(resp["Body"])
+        if tbl == "dim_date":
+            df["full_date"] = pd.to_datetime(df["full_date"]).dt.date
+        if tbl == "fact_sales":
+            df["ingestion_date"] = pd.to_datetime(df["ingestion_date"]).dt.date
+        result[tbl] = df
+    return result
 
 
-def create_star_schema(engine) -> None:
-    """Create PostgreSQL tables and constraints if they do not exist."""
+# ---- Postgres DDL + loading ----
+
+def create_star_schema(engine):
+    """Set up the warehouse tables if they don't exist yet."""
     ddl = """
     CREATE TABLE IF NOT EXISTS dim_product (
         product_key VARCHAR(64) PRIMARY KEY,
@@ -294,66 +289,70 @@ def create_star_schema(engine) -> None:
     CREATE INDEX IF NOT EXISTS idx_fact_sales_ingestion_date ON fact_sales(ingestion_date);
     CREATE INDEX IF NOT EXISTS idx_fact_sales_date_region ON fact_sales(date_key, region_key);
     """
-    with engine.begin() as connection:
-        for statement in ddl.split(";"):
-            if statement.strip():
-                connection.execute(text(statement))
+    with engine.begin() as conn:
+        for stmt in ddl.split(";"):
+            if stmt.strip():
+                conn.execute(text(stmt))
 
 
-def load_star_schema(engine, star_schema: dict[str, pd.DataFrame], ingestion_date: date) -> None:
-    """Load dimensions and replace only one ingestion-date fact partition."""
+def load_star_schema(engine, star_schema, ingestion_date):
+    """Upsert dims (ON CONFLICT DO NOTHING) and replace the fact partition for this date."""
     create_star_schema(engine)
-    with engine.begin() as connection:
-        connection.execute(text("DELETE FROM fact_sales WHERE ingestion_date = :ingestion_date"), {"ingestion_date": ingestion_date})
-        for table_name in ("dim_product", "dim_customer", "dim_date", "dim_region"):
-            frame = star_schema[table_name]
-            records = frame.where(pd.notna(frame), None).to_dict(orient="records")
+
+    with engine.begin() as conn:
+        # wipe facts for this partition so re-runs are clean
+        conn.execute(
+            text("DELETE FROM fact_sales WHERE ingestion_date = :dt"),
+            {"dt": ingestion_date},
+        )
+
+        # load dimensions
+        pk_map = {
+            "dim_product": "product_key",
+            "dim_customer": "customer_key",
+            "dim_date": "date_key",
+            "dim_region": "region_key",
+        }
+        for tbl_name in ("dim_product", "dim_customer", "dim_date", "dim_region"):
+            df = star_schema[tbl_name]
+            records = df.where(pd.notna(df), None).to_dict(orient="records")
             if not records:
                 continue
-            columns = list(frame.columns)
-            column_sql = ", ".join(columns)
-            value_sql = ", ".join(f":{column}" for column in columns)
-            conflict_column = {
-                "dim_product": "product_key",
-                "dim_customer": "customer_key",
-                "dim_date": "date_key",
-                "dim_region": "region_key",
-            }[table_name]
-            connection.execute(
-                text(f"INSERT INTO {table_name} ({column_sql}) VALUES ({value_sql}) ON CONFLICT ({conflict_column}) DO NOTHING"),
+            cols = list(df.columns)
+            col_sql = ", ".join(cols)
+            val_sql = ", ".join(f":{c}" for c in cols)
+            pk = pk_map[tbl_name]
+            conn.execute(
+                text(f"INSERT INTO {tbl_name} ({col_sql}) VALUES ({val_sql}) ON CONFLICT ({pk}) DO NOTHING"),
                 records,
             )
 
-        facts = star_schema["fact_sales"].where(pd.notna(star_schema["fact_sales"]), None)
-        records = facts.to_dict(orient="records")
+        # load facts
+        fact_df = star_schema["fact_sales"].where(pd.notna(star_schema["fact_sales"]), None)
+        records = fact_df.to_dict(orient="records")
         if records:
-            columns = list(facts.columns)
-            column_sql = ", ".join(columns)
-            value_sql = ", ".join(f":{column}" for column in columns)
-            connection.execute(
-                text(f"INSERT INTO fact_sales ({column_sql}) VALUES ({value_sql}) ON CONFLICT (transaction_id) DO NOTHING"),
+            cols = list(fact_df.columns)
+            col_sql = ", ".join(cols)
+            val_sql = ", ".join(f":{c}" for c in cols)
+            conn.execute(
+                text(f"INSERT INTO fact_sales ({col_sql}) VALUES ({val_sql}) ON CONFLICT (transaction_id) DO NOTHING"),
                 records,
             )
 
 
-def transform_and_load(
-    frame: pd.DataFrame,
-    ingestion_date: date,
-    *,
-    database_url: str | None = None,
-) -> dict[str, pd.DataFrame]:
-    """Clean, model, and load one landed partition."""
-    star_schema = build_star_schema(clean_transactions(frame, ingestion_date))
+def transform_and_load(frame, ingestion_date, *, database_url=None):
+    """Main entry point: clean → build star schema → load into Postgres."""
+    star = build_star_schema(clean_transactions(frame, ingestion_date))
     engine = create_engine(database_url or os.environ["DATABASE_URL"])
-    load_star_schema(engine, star_schema, ingestion_date)
-    LOGGER.info("Loaded %d fact rows for ingestion_date=%s", len(star_schema["fact_sales"]), ingestion_date)
-    return star_schema
+    load_star_schema(engine, star, ingestion_date)
+    LOGGER.info("Loaded %d fact rows for %s", len(star["fact_sales"]), ingestion_date)
+    return star
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Transform and load retail data into warehouse")
     parser.add_argument("--ingestion-date", required=True, type=date.fromisoformat)
-    parser.add_argument("--input", type=Path, help="Local validated CSV; otherwise read S3 landing storage")
+    parser.add_argument("--input", type=Path, help="Local CSV instead of reading from S3")
     parser.add_argument("--bucket", default=os.getenv("LANDING_BUCKET", "insightguard-landing"))
     parser.add_argument("--endpoint-url", default=os.getenv("S3_ENDPOINT_URL"))
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"))
@@ -363,5 +362,8 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
-    source = pd.read_csv(args.input) if args.input else read_landing_transactions(args.bucket, args.ingestion_date, endpoint_url=args.endpoint_url)
+    if args.input:
+        source = pd.read_csv(args.input)
+    else:
+        source = read_landing_transactions(args.bucket, args.ingestion_date, endpoint_url=args.endpoint_url)
     transform_and_load(source, args.ingestion_date, database_url=args.database_url)

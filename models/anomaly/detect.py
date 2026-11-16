@@ -1,6 +1,5 @@
-"""Rolling z-score anomaly detection for daily regional revenue and returns."""
-
-from __future__ import annotations
+"""Anomaly detection — flags unusual daily revenue/return values per region
+using a shifted rolling z-score approach."""
 
 import logging
 from datetime import date, datetime, timezone
@@ -12,46 +11,49 @@ from sqlalchemy import text
 LOGGER = logging.getLogger("insightguard.models.anomaly")
 
 
-def detect_anomalies(
-    daily_metrics: pd.DataFrame,
-    *,
-    window: int = 7,
-    min_periods: int = 3,
-    z_threshold: float = 3.0,
-) -> pd.DataFrame:
-    """Flag regional revenue/return values against a prior rolling baseline."""
+def detect_anomalies(daily_metrics, *, window=7, min_periods=3, z_threshold=3.0):
+    """Compute rolling z-scores per region and flag anything above the threshold.
+
+    Uses shift(1) so the current day's value doesn't leak into its own baseline.
+    """
     required = {"metric_date", "region_key", "region_name", "revenue", "returns"}
     missing = required.difference(daily_metrics.columns)
     if missing:
         raise ValueError(f"Missing daily metric columns: {', '.join(sorted(missing))}")
     if window < 2 or min_periods < 2:
-        raise ValueError("window and min_periods must both be at least 2")
+        raise ValueError("window and min_periods must both be >= 2")
 
     flags = daily_metrics.copy()
     flags["metric_date"] = pd.to_datetime(flags["metric_date"]).dt.date
     flags = flags.sort_values(["region_key", "metric_date"]).reset_index(drop=True)
+
     grouped = flags.groupby("region_key", sort=False)
 
-    for metric in ("revenue", "returns"):
-        flags[metric] = pd.to_numeric(flags[metric], errors="coerce").fillna(0.0)
-        flags[f"{metric}_baseline"] = grouped[metric].transform(
-            lambda series: series.shift(1).rolling(window=window, min_periods=min_periods).mean()
+    for col in ("revenue", "returns"):
+        flags[col] = pd.to_numeric(flags[col], errors="coerce").fillna(0.0)
+
+        # shifted rolling mean + std (don't include today in the baseline)
+        flags[f"{col}_baseline"] = grouped[col].transform(
+            lambda s: s.shift(1).rolling(window=window, min_periods=min_periods).mean()
         )
-        flags[f"{metric}_baseline_std"] = grouped[metric].transform(
-            lambda series: series.shift(1).rolling(window=window, min_periods=min_periods).std(ddof=0)
+        flags[f"{col}_baseline_std"] = grouped[col].transform(
+            lambda s: s.shift(1).rolling(window=window, min_periods=min_periods).std(ddof=0)
         )
-        flags[f"{metric}_zscore"] = (
-            (flags[metric] - flags[f"{metric}_baseline"])
-            .div(flags[f"{metric}_baseline_std"].replace(0, np.nan))
+        flags[f"{col}_zscore"] = (
+            (flags[col] - flags[f"{col}_baseline"])
+            .div(flags[f"{col}_baseline_std"].replace(0, np.nan))
         )
 
-    flags["revenue_zscore"] = flags["revenue_zscore"].replace([np.inf, -np.inf], np.nan)
-    flags["returns_zscore"] = flags["returns_zscore"].replace([np.inf, -np.inf], np.nan)
-    revenue_alert = flags["revenue_zscore"].abs().ge(z_threshold)
-    returns_alert = flags["returns_zscore"].abs().ge(z_threshold)
-    flags["is_anomaly"] = revenue_alert | returns_alert
+    # clean up infinities
+    for col in ("revenue_zscore", "returns_zscore"):
+        flags[col] = flags[col].replace([np.inf, -np.inf], np.nan)
+
+    rev_alert = flags["revenue_zscore"].abs().ge(z_threshold)
+    ret_alert = flags["returns_zscore"].abs().ge(z_threshold)
+
+    flags["is_anomaly"] = rev_alert | ret_alert
     flags["anomaly_type"] = np.select(
-        [revenue_alert & returns_alert, revenue_alert, returns_alert],
+        [rev_alert & ret_alert, rev_alert, ret_alert],
         ["revenue_and_returns", "revenue", "returns"],
         default="none",
     )
@@ -62,16 +64,16 @@ def detect_anomalies(
         labels=["normal", "medium", "high"],
         right=False,
     ).astype("string")
-    return flags[
-        [
-            "metric_date", "region_key", "region_name", "revenue", "returns", "revenue_baseline",
-            "returns_baseline", "revenue_zscore", "returns_zscore", "is_anomaly", "anomaly_type",
-            "severity_score", "severity",
-        ]
+
+    out_cols = [
+        "metric_date", "region_key", "region_name", "revenue", "returns", "revenue_baseline",
+        "returns_baseline", "revenue_zscore", "returns_zscore", "is_anomaly", "anomaly_type",
+        "severity_score", "severity",
     ]
+    return flags[out_cols]
 
 
-def fetch_daily_metrics(engine, run_date: date | None = None) -> pd.DataFrame:
+def fetch_daily_metrics(engine, run_date=None):
     query = """
         SELECT d.full_date AS metric_date,
                f.region_key,
@@ -88,7 +90,7 @@ def fetch_daily_metrics(engine, run_date: date | None = None) -> pd.DataFrame:
     return pd.read_sql(text(query), engine, params={"run_date": run_date})
 
 
-def create_anomaly_table(engine) -> None:
+def create_anomaly_table(engine):
     ddl = """
     CREATE TABLE IF NOT EXISTS anomaly_flags (
         metric_date DATE NOT NULL,
@@ -108,45 +110,49 @@ def create_anomaly_table(engine) -> None:
         PRIMARY KEY (metric_date, region_key)
     );
     """
-    with engine.begin() as connection:
-        connection.execute(text(ddl))
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
 
 
-def persist_anomalies(engine, flags: pd.DataFrame) -> None:
-    """Replace the supplied metric range, making reruns deterministic."""
+def persist_anomalies(engine, flags):
+    """Write anomaly flags to Postgres. Replaces the date range covered by this batch."""
     if flags.empty:
         return
     create_anomaly_table(engine)
+
     rows = flags.copy()
     rows["detected_at"] = datetime.now(timezone.utc)
     records = rows.astype(object).where(pd.notna(rows), None).to_dict(orient="records")
-    for record in records:
-        if isinstance(record["detected_at"], pd.Timestamp):
-            record["detected_at"] = record["detected_at"].to_pydatetime()
-    columns = [
+
+    # sqlalchemy can be picky about pd.Timestamp vs datetime
+    for rec in records:
+        if isinstance(rec["detected_at"], pd.Timestamp):
+            rec["detected_at"] = rec["detected_at"].to_pydatetime()
+
+    cols = [
         "metric_date", "region_key", "region_name", "revenue", "returns", "revenue_baseline",
         "returns_baseline", "revenue_zscore", "returns_zscore", "is_anomaly", "anomaly_type",
         "severity_score", "severity", "detected_at",
     ]
-    with engine.begin() as connection:
-        connection.execute(
+    with engine.begin() as conn:
+        conn.execute(
             text("DELETE FROM anomaly_flags WHERE metric_date BETWEEN :start_date AND :end_date"),
             {"start_date": rows["metric_date"].min(), "end_date": rows["metric_date"].max()},
         )
-        connection.execute(
+        conn.execute(
             text(
-                f"INSERT INTO anomaly_flags ({', '.join(columns)}) "
-                f"VALUES ({', '.join(':' + c for c in columns)}) "
+                f"INSERT INTO anomaly_flags ({', '.join(cols)}) "
+                f"VALUES ({', '.join(':' + c for c in cols)}) "
                 "ON CONFLICT (metric_date, region_key) DO UPDATE SET "
-                + ", ".join(f"{c}=EXCLUDED.{c}" for c in columns[2:])
+                + ", ".join(f"{c}=EXCLUDED.{c}" for c in cols[2:])
             ),
             records,
         )
 
 
-def run_anomaly_detection(engine, *, run_date: date | None = None) -> pd.DataFrame:
+def run_anomaly_detection(engine, *, run_date=None):
     metrics = fetch_daily_metrics(engine, run_date)
     flags = detect_anomalies(metrics)
     persist_anomalies(engine, flags)
-    LOGGER.info("Persisted %d regional daily anomaly flags", len(flags))
+    LOGGER.info("Wrote %d anomaly flag rows", len(flags))
     return flags

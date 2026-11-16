@@ -1,6 +1,4 @@
-"""Download, validate, and land retail transactions in S3-compatible storage."""
-
-from __future__ import annotations
+"""Ingestion module — downloads, validates, and lands retail transaction data in S3."""
 
 import argparse
 import io
@@ -11,7 +9,6 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Iterable
 
 import boto3
 import pandas as pd
@@ -43,8 +40,7 @@ class ValidationReport:
     rejection_reasons: dict[str, int]
 
 
-def create_s3_client(endpoint_url: str | None = None):
-    """Create an S3 client for AWS or a locally running Moto server."""
+def create_s3_client(endpoint_url=None):
     return boto3.client(
         "s3",
         endpoint_url=endpoint_url or os.getenv("S3_ENDPOINT_URL"),
@@ -55,8 +51,8 @@ def create_s3_client(endpoint_url: str | None = None):
 
 
 @contextmanager
-def s3_backend(endpoint_url: str | None = None):
-    """Provide an in-process Moto mock when requested, otherwise use the endpoint."""
+def s3_backend(endpoint_url=None):
+    """Either use in-process moto mock or hit the real/persistent endpoint."""
     if os.getenv("USE_MOTO_S3", "false").lower() == "true":
         from moto import mock_aws
 
@@ -66,119 +62,124 @@ def s3_backend(endpoint_url: str | None = None):
         yield create_s3_client(endpoint_url)
 
 
-def read_source(source: str) -> tuple[pd.DataFrame, bytes, str]:
-    """Read a local or HTTP CSV/XLSX source and return its raw bytes as well."""
+def read_source(source: str):
+    """Read CSV or XLSX from a local path or URL. Returns (dataframe, raw_bytes, filename)."""
     source_path = Path(source)
     if source_path.exists():
         raw_bytes = source_path.read_bytes()
         name = source_path.name
     else:
         LOGGER.info("Downloading source: %s", source)
-        response = requests.get(source, timeout=120)
-        response.raise_for_status()
-        raw_bytes = response.content
+        resp = requests.get(source, timeout=120)
+        resp.raise_for_status()
+        raw_bytes = resp.content
+        # grab just the filename from the URL
         name = source.split("?")[0].rsplit("/", 1)[-1] or "source.csv"
 
-    suffix = Path(name).suffix.lower()
-    if suffix in {".xlsx", ".xls"}:
+    ext = Path(name).suffix.lower()
+    if ext in {".xlsx", ".xls"}:
         frame = pd.read_excel(io.BytesIO(raw_bytes))
-    elif suffix == ".csv" or not suffix:
+    elif ext == ".csv" or not ext:
         frame = pd.read_csv(io.BytesIO(raw_bytes))
     else:
-        raise ValueError(f"Unsupported source format '{suffix}'. Use CSV or XLSX.")
+        raise ValueError(f"Unsupported format '{ext}' — use CSV or XLSX")
     return frame, raw_bytes, name
 
 
-def _reason_counts(reasons: Iterable[str]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for reason in reasons:
-        counts[reason] = counts.get(reason, 0) + 1
-    return counts
+def _count_reasons(reasons):
+    out = {}
+    for r in reasons:
+        out[r] = out.get(r, 0) + 1
+    return out
 
 
-def validate_schema(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, ValidationReport]:
-    """Validate the UCI Online Retail column contract and separate bad rows."""
-    missing_columns = REQUIRED_COLUMNS.difference(frame.columns)
-    if missing_columns:
-        missing = ", ".join(sorted(missing_columns))
-        raise ValueError(f"Missing required columns: {missing}")
+def validate_schema(frame: pd.DataFrame):
+    """Check that the dataframe matches the UCI Online Retail column contract.
+    Returns (accepted_df, rejected_df, ValidationReport).
+    """
+    missing_cols = REQUIRED_COLUMNS.difference(frame.columns)
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {', '.join(sorted(missing_cols))}")
 
-    working = frame.copy()
-    reasons = pd.Series("", index=working.index, dtype="string")
+    df = frame.copy()
+    reasons = pd.Series("", index=df.index, dtype="string")
 
-    def mark(mask: pd.Series, reason: str) -> None:
+    def flag(mask, reason):
         reasons.loc[mask & reasons.eq("")] = reason
 
-    for column in REQUIRED_COLUMNS - OPTIONAL_NULLABLE_COLUMNS:
-        mark(working[column].isna(), f"missing_{column.lower()}")
-    mark(working["Description"].isna(), "missing_description")
+    # check for nulls in non-nullable columns
+    for col in REQUIRED_COLUMNS - OPTIONAL_NULLABLE_COLUMNS:
+        flag(df[col].isna(), f"missing_{col.lower()}")
+    flag(df["Description"].isna(), "missing_description")
 
-    quantity = pd.to_numeric(working["Quantity"], errors="coerce")
-    unit_price = pd.to_numeric(working["UnitPrice"], errors="coerce")
-    invoice_date = pd.to_datetime(working["InvoiceDate"], errors="coerce", dayfirst=True)
-    customer_id = pd.to_numeric(working["CustomerID"], errors="coerce")
+    # try coercing numeric/date columns
+    qty = pd.to_numeric(df["Quantity"], errors="coerce")
+    price = pd.to_numeric(df["UnitPrice"], errors="coerce")
+    inv_date = pd.to_datetime(df["InvoiceDate"], errors="coerce", dayfirst=True)
+    cust_id = pd.to_numeric(df["CustomerID"], errors="coerce")
 
-    mark(quantity.isna(), "invalid_quantity")
-    mark(unit_price.isna(), "invalid_unit_price")
-    mark(invoice_date.isna(), "invalid_invoice_date")
-    mark(working["CustomerID"].notna() & customer_id.isna(), "invalid_customer_id")
+    flag(qty.isna(), "invalid_quantity")
+    flag(price.isna(), "invalid_unit_price")
+    flag(inv_date.isna(), "invalid_invoice_date")
+    flag(df["CustomerID"].notna() & cust_id.isna(), "invalid_customer_id")
 
-    working["Quantity"] = quantity.astype("Int64")
-    working["UnitPrice"] = unit_price.astype("Float64")
-    working["InvoiceDate"] = invoice_date
-    working["CustomerID"] = customer_id.astype("Int64")
+    df["Quantity"] = qty.astype("Int64")
+    df["UnitPrice"] = price.astype("Float64")
+    df["InvoiceDate"] = inv_date
+    df["CustomerID"] = cust_id.astype("Int64")
 
-    rejected = working.loc[reasons.ne("")].copy()
+    rejected = df.loc[reasons.ne("")].copy()
     rejected["rejection_reason"] = reasons.loc[reasons.ne("")]
-    accepted = working.loc[reasons.eq("")].copy()
+    accepted = df.loc[reasons.eq("")].copy()
 
     report = ValidationReport(
         source_rows=len(frame),
         accepted_rows=len(accepted),
         rejected_rows=len(rejected),
-        rejection_reasons=_reason_counts(rejected["rejection_reason"].tolist()),
+        rejection_reasons=_count_reasons(rejected["rejection_reason"].tolist()),
     )
     return accepted, rejected, report
 
 
 def upload_to_s3(
-    raw_bytes: bytes,
-    accepted: pd.DataFrame,
-    rejected: pd.DataFrame,
-    report: ValidationReport,
+    raw_bytes,
+    accepted,
+    rejected,
+    report,
     *,
-    bucket: str,
-    ingestion_date: date,
-    source_name: str,
-    endpoint_url: str | None = None,
+    bucket,
+    ingestion_date,
+    source_name,
+    endpoint_url=None,
     client=None,
-) -> list[str]:
-    """Upload raw, accepted, rejected, and manifest objects to the landing bucket."""
+):
+    """Write raw, accepted, rejected CSVs and a manifest JSON into the landing bucket."""
     client = client or create_s3_client(endpoint_url)
+
+    # make sure bucket exists
     try:
         client.head_bucket(Bucket=bucket)
     except client.exceptions.ClientError:
         client.create_bucket(Bucket=bucket)
 
-    partition = f"landing/ingestion_date={ingestion_date.isoformat()}"
-    raw_key = f"{partition}/raw/{source_name}"
-    accepted_key = f"{partition}/validated/transactions.csv"
-    rejected_key = f"{partition}/rejected/rejected_rows.csv"
-    manifest_key = f"{partition}/manifest.json"
+    prefix = f"landing/ingestion_date={ingestion_date.isoformat()}"
+    raw_key = f"{prefix}/raw/{source_name}"
+    accepted_key = f"{prefix}/validated/transactions.csv"
+    rejected_key = f"{prefix}/rejected/rejected_rows.csv"
+    manifest_key = f"{prefix}/manifest.json"
 
     client.put_object(Bucket=bucket, Key=raw_key, Body=raw_bytes)
     client.put_object(
-        Bucket=bucket,
-        Key=accepted_key,
+        Bucket=bucket, Key=accepted_key,
         Body=accepted.to_csv(index=False).encode("utf-8"),
         ContentType="text/csv",
     )
     client.put_object(
-        Bucket=bucket,
-        Key=rejected_key,
+        Bucket=bucket, Key=rejected_key,
         Body=rejected.to_csv(index=False).encode("utf-8"),
         ContentType="text/csv",
     )
+
     manifest = {
         "source_name": source_name,
         "ingestion_date": ingestion_date.isoformat(),
@@ -187,8 +188,7 @@ def upload_to_s3(
         "validation": asdict(report),
     }
     client.put_object(
-        Bucket=bucket,
-        Key=manifest_key,
+        Bucket=bucket, Key=manifest_key,
         Body=json.dumps(manifest, indent=2).encode("utf-8"),
         ContentType="application/json",
     )
@@ -196,40 +196,35 @@ def upload_to_s3(
 
 
 def ingest(
-    source: str,
+    source,
     *,
-    bucket: str = "insightguard-landing",
-    ingestion_date: date | None = None,
-    endpoint_url: str | None = None,
-) -> ValidationReport:
+    bucket="insightguard-landing",
+    ingestion_date=None,
+    endpoint_url=None,
+):
     frame, raw_bytes, source_name = read_source(source)
     accepted, rejected, report = validate_schema(frame)
     partition_date = ingestion_date or datetime.now(timezone.utc).date()
+
     with s3_backend(endpoint_url) as client:
         keys = upload_to_s3(
-            raw_bytes,
-            accepted,
-            rejected,
-            report,
+            raw_bytes, accepted, rejected, report,
             bucket=bucket,
             ingestion_date=partition_date,
             source_name=source_name,
             endpoint_url=endpoint_url,
             client=client,
         )
+
     LOGGER.info(
-        "Ingestion complete: source_rows=%d accepted_rows=%d rejected_rows=%d keys=%s reasons=%s",
-        report.source_rows,
-        report.accepted_rows,
-        report.rejected_rows,
-        keys,
-        report.rejection_reasons,
+        "Ingestion done — %d source rows, %d accepted, %d rejected. Keys: %s",
+        report.source_rows, report.accepted_rows, report.rejected_rows, keys,
     )
     return report
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Ingest retail transaction data into S3 landing zone")
     parser.add_argument("--source", default=os.getenv("RAW_SOURCE", DEFAULT_SOURCE_URL))
     parser.add_argument("--bucket", default=os.getenv("LANDING_BUCKET", "insightguard-landing"))
     parser.add_argument("--endpoint-url", default=os.getenv("S3_ENDPOINT_URL"))

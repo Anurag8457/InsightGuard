@@ -1,49 +1,45 @@
--- InsightGuard BI layer.
--- Run this script against the PostgreSQL warehouse after the model tables exist.
+-- BI views for InsightGuard
+-- Run against the Postgres warehouse after loading the star schema + model tables
 
 CREATE OR REPLACE VIEW vw_kpi_summary AS
 SELECT
-    MAX(d.full_date) AS latest_sales_date,
-    MIN(d.full_date) AS earliest_sales_date,
-    COUNT(DISTINCT f.invoice_no) AS order_count,
-    COUNT(DISTINCT NULLIF(c.customer_id, 'UNKNOWN')) AS customer_count,
+    MAX(d.full_date)  AS latest_sales_date,
+    MIN(d.full_date)  AS earliest_sales_date,
+    COUNT(DISTINCT f.invoice_no)  AS order_count,
+    COUNT(DISTINCT NULLIF(c.customer_id, 'UNKNOWN'))  AS customer_count,
     COUNT(DISTINCT f.product_key) AS product_count,
-    SUM(f.quantity) FILTER (WHERE f.quantity > 0) AS units_sold,
-    ROUND(SUM(f.net_sales), 2) AS total_revenue,
-    ROUND(SUM(f.return_amount), 2) AS total_returns,
-    COUNT(*) FILTER (WHERE f.is_return) AS return_line_count,
-    (
-        SELECT COUNT(*)
-        FROM anomaly_flags anomaly_summary
-        WHERE anomaly_summary.is_anomaly
-    ) AS anomaly_count
+    SUM(f.quantity) FILTER (WHERE f.quantity > 0)  AS units_sold,
+    ROUND(SUM(f.net_sales), 2)      AS total_revenue,
+    ROUND(SUM(f.return_amount), 2)  AS total_returns,
+    COUNT(*) FILTER (WHERE f.is_return)  AS return_line_count,
+    (SELECT COUNT(*) FROM anomaly_flags af WHERE af.is_anomaly)  AS anomaly_count
 FROM fact_sales f
-JOIN dim_date d ON d.date_key = f.date_key
+JOIN dim_date d     ON d.date_key = f.date_key
 JOIN dim_customer c ON c.customer_key = f.customer_key
 LEFT JOIN anomaly_flags a
-    ON a.metric_date = d.full_date
-   AND a.region_key = f.region_key
+    ON a.metric_date = d.full_date AND a.region_key = f.region_key
 ;
 
 CREATE OR REPLACE VIEW vw_sales_trend AS
 SELECT
-    d.full_date AS sales_date,
+    d.full_date   AS sales_date,
     r.region_name,
     COUNT(DISTINCT f.invoice_no) AS order_count,
     SUM(f.quantity) FILTER (WHERE f.quantity > 0) AS units_sold,
-    ROUND(SUM(f.net_sales), 2) AS revenue,
+    ROUND(SUM(f.net_sales), 2)     AS revenue,
     ROUND(SUM(f.return_amount), 2) AS returns,
-    ROUND(AVG(f.net_sales), 2) AS average_line_revenue
+    ROUND(AVG(f.net_sales), 2)     AS avg_line_revenue
 FROM fact_sales f
-JOIN dim_date d ON d.date_key = f.date_key
+JOIN dim_date d   ON d.date_key = f.date_key
 JOIN dim_region r ON r.region_key = f.region_key
 GROUP BY d.full_date, r.region_name
 ;
 
--- Online Retail does not include a product category column. This view exposes
--- a replaceable, description-keyword heuristic for portfolio dashboarding.
+-- Product category is a keyword heuristic since the UCI dataset
+-- doesn't have a real category column. Replace the CASE when you
+-- have an actual taxonomy.
 CREATE OR REPLACE VIEW vw_region_category_breakdown AS
-WITH categorized_products AS (
+WITH cats AS (
     SELECT
         product_key,
         CASE
@@ -58,27 +54,27 @@ WITH categorized_products AS (
 )
 SELECT
     r.region_name,
-    cp.category,
+    cats.category,
     COUNT(DISTINCT f.invoice_no) AS order_count,
     SUM(f.quantity) FILTER (WHERE f.quantity > 0) AS units_sold,
-    ROUND(SUM(f.net_sales), 2) AS revenue,
+    ROUND(SUM(f.net_sales), 2)     AS revenue,
     ROUND(SUM(f.return_amount), 2) AS returns
 FROM fact_sales f
 JOIN dim_region r ON r.region_key = f.region_key
-JOIN categorized_products cp ON cp.product_key = f.product_key
-GROUP BY r.region_name, cp.category
+JOIN cats        ON cats.product_key = f.product_key
+GROUP BY r.region_name, cats.category
 ;
 
 CREATE OR REPLACE VIEW vw_anomalies AS
 SELECT
     a.metric_date,
     a.region_name,
-    ROUND(a.revenue, 2) AS revenue,
-    ROUND(a.returns, 2) AS returns,
+    ROUND(a.revenue, 2)          AS revenue,
+    ROUND(a.returns, 2)          AS returns,
     ROUND(a.revenue_baseline, 2) AS revenue_baseline,
     ROUND(a.returns_baseline, 2) AS returns_baseline,
-    ROUND(a.revenue_zscore, 4) AS revenue_zscore,
-    ROUND(a.returns_zscore, 4) AS returns_zscore,
+    ROUND(a.revenue_zscore, 4)   AS revenue_zscore,
+    ROUND(a.returns_zscore, 4)   AS returns_zscore,
     a.anomaly_type,
     a.severity,
     ROUND(a.severity_score, 4) AS severity_score,

@@ -1,12 +1,12 @@
 # BI connection guide
 
-InsightGuard exposes PostgreSQL views for Power BI or Tableau. No Python dashboard is included.
+InsightGuard exposes a set of Postgres views for Power BI or Tableau — no Python dashboard included.
 
-## Connection
+## Connecting
 
-Start a local PostgreSQL instance and apply the warehouse/model scripts first. Then run `dashboard/views.sql` as the warehouse user.
+Make sure Postgres is running and you've loaded the warehouse tables + run `dashboard/views.sql`.
 
-Default local connection values from the project configuration are:
+Default local connection:
 
 | Setting | Value |
 |---|---|
@@ -16,15 +16,20 @@ Default local connection values from the project configuration are:
 | User | `insightguard` |
 | Password | `insightguard` |
 
-In Power BI, choose **Get Data → PostgreSQL database**, enter the connection values, and select these views:
+**Power BI:** Get Data → PostgreSQL database → enter the above → select the views listed below.
 
-- `vw_kpi_summary` — headline KPIs and date range
-- `vw_sales_trend` — daily revenue, returns, orders, and units by region
-- `vw_region_category_breakdown` — regional/category comparison
-- `vw_anomalies` — anomaly list with z-scores and severity
+**Tableau:** Connect → To a Server → PostgreSQL → same connection info → add views as data sources.
+
+## Available views
+
+- `vw_kpi_summary` — headline numbers (revenue, returns, order count, etc.)
+- `vw_sales_trend` — daily revenue/returns/orders broken down by region
+- `vw_region_category_breakdown` — region × product category comparison
+- `vw_anomalies` — flagged anomalies with z-scores and severity
 - `vw_revenue_forecast` — 7-day and 30-day forecast rows
 
-In Tableau, choose **Connect → To a Server → PostgreSQL**, enter the same values, and add the views as logical tables or custom SQL sources.
+## Notes
 
-For production, replace the local host/database with the Redshift-compatible warehouse endpoint and keep the view names stable. The category field is a documented keyword heuristic because the source dataset contains product descriptions but no native category column; replace that CASE expression with a maintained product taxonomy when one becomes available.
+The category field is a keyword heuristic on product descriptions since the source data doesn't have a real category column. Replace the CASE expression in `vw_region_category_breakdown` with a proper product taxonomy when you have one.
 
+For production, swap `localhost` with your Redshift/warehouse endpoint and keep the view names the same.
