@@ -1,7 +1,7 @@
 """Forecast regional revenue using simple exponential smoothing."""
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 import pandas as pd
 from sqlalchemy import text
